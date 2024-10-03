@@ -10,48 +10,59 @@ locals {
   CSV
 
   contacts = csvdecode(local.csv_data)
+
+  mapping = {
+    name_field        = "name"
+    code_field        = "code"
+    destination_field = "destination"
+    label_fields      = ["foo_label"]
+    variable_fields   = ["foo_variable", "bar_variable"]
+    group_by_fields   = ["name", "foo_variable"]
+  }
 }
 
 output "example" {
-  value = provider::webitel::unique_contact(local.contacts, "name", "code", "destination", ["foo_label"], ["foo_variable", "bar_variable"])
+  value = provider::webitel::unique_contact(local.contacts, local.mapping)
 }
 
 # Outputs:
 #  + example = {
-#      + bar1 = {
+#      + bar1-foo = {
 #          + destinations = [
 #              + {
 #                  + code        = "1"
-#                  + destination = "123"
+#                  + destination = "+123"
 #                },
 #            ]
 #          + labels       = [
 #              + "local",
 #            ]
+#          + name         = "bar1"
 #          + variables    = {
 #              + bar_variable = "bar"
 #              + foo_variable = "foo"
 #            }
 #        }
-#      + foo1 = {
+#      + foo1-foo = {
 #          + destinations = [
 #              + {
 #                  + code        = "1"
-#                  + destination = "123"
+#                  + destination = "+123"
 #                },
 #              + {
 #                  + code        = "1"
-#                  + destination = "456"
+#                  + destination = "+456"
 #                },
 #              + {
 #                  + code        = "2"
-#                  + destination = "789"
+#                  + destination = "+789"
 #                },
 #            ]
 #          + labels       = [
 #              + "local",
 #              + "other",
 #            ]
+#          + name         = "foo1"
 #          + variables    = {
 #              + bar_variable = "bar"
 #              + foo_variable = "foo"

@@ -234,17 +234,13 @@ func (r *ContactResource) Read(ctx context.Context, req resource.ReadRequest, re
 		return
 	}
 
-	size := int32(10)
-	q := stripSpaces(data.Name.ValueString())
-	input := &contacts.ContactsSearchContactsParams{
+	input := &contacts.ContactsLocateContactParams{
 		Context: ctx,
 		Fields:  contactDefaultFields,
-		Q:       &q,
-		Qin:     []string{"name"},
-		Size:    &size,
+		Etag:    data.ETag.ValueString(),
 	}
 
-	httpResp, err := r.client.Contacts.ContactsSearchContacts(input)
+	httpResp, err := r.client.Contacts.ContactsLocateContact(input)
 	if err != nil {
 		resp.Diagnostics.AddError(
 			"Unable to Refresh Resource",
@@ -256,30 +252,15 @@ func (r *ContactResource) Read(ctx context.Context, req resource.ReadRequest, re
 		return
 	}
 
-	payload := httpResp.GetPayload()
-
 	// Treat HTTP 404 Not Found status as a signal to recreate resource
 	// and return early
-	if httpResp.IsCode(http.StatusNotFound) || len(payload.Data) == 0 {
+	if httpResp.IsCode(http.StatusNotFound) {
 		resp.State.RemoveResource(ctx)
 
 		return
 	}
 
-	var contact *models.WebitelContactsContact
-	for _, v := range payload.Data {
-		if v.Name.CommonName == q {
-			contact = v
-
-			break
-		}
-	}
-
-	if contact == nil {
-		resp.State.RemoveResource(ctx)
-
-		return
-	}
+	contact := httpResp.GetPayload()
 
 	// Save updated data into Terraform state
 	resp.Diagnostics.Append(resp.State.Set(ctx, contactToTF(contact))...)

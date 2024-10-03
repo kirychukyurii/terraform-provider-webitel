@@ -5,6 +5,8 @@ package provider
 
 import (
 	"context"
+	"regexp"
+	"strings"
 	"sync"
 
 	"github.com/hashicorp/terraform-plugin-framework/attr"
@@ -13,16 +15,18 @@ import (
 	"github.com/hashicorp/terraform-plugin-log/tflog"
 )
 
+var destinationRegexp = regexp.MustCompile(`\D`)
+
 // Ensure the implementation satisfies the desired interfaces.
 var _ function.Function = &UniqueContactFunction{}
 
 type UniqueContactModel struct {
-	CSV              types.List   `tfsdk:"csv"`
-	GroupByField     types.String `tfsdk:"group_by_field"`
+	NameField        types.String `tfsdk:"name_field"`
 	CodeField        types.String `tfsdk:"code_field"`
 	DestinationField types.String `tfsdk:"destination_field"`
 	Labels           types.List   `tfsdk:"label_fields"`
 	Variables        types.List   `tfsdk:"variable_fields"`
+	GroupByFields    types.List   `tfsdk:"group_by_fields"`
 }
 
 type UniqueContactFunction struct{}
@@ -38,7 +42,7 @@ func (f *UniqueContactFunction) Metadata(ctx context.Context, req function.Metad
 func (f *UniqueContactFunction) Definition(ctx context.Context, req function.DefinitionRequest, resp *function.DefinitionResponse) {
 	resp.Definition = function.Definition{
 		Summary:     "Compute contacts data without duplicates",
-		Description: "Merge contacts with duplicate names.",
+		Description: "Merge contacts grouped by group_by_fields.",
 		Parameters: []function.Parameter{
 			function.ListParameter{
 				Name: "csv",
@@ -46,22 +50,22 @@ func (f *UniqueContactFunction) Definition(ctx context.Context, req function.Def
 					ElemType: types.StringType,
 				},
 			},
-			function.StringParameter{
-				Name: "group_by_field",
-			},
-			function.StringParameter{
-				Name: "code_field",
-			},
-			function.StringParameter{
-				Name: "destination_field",
-			},
-			function.ListParameter{
-				Name:        "label_fields",
-				ElementType: types.StringType,
-			},
-			function.ListParameter{
-				Name:        "variable_fields",
-				ElementType: types.StringType,
+			function.ObjectParameter{
+				Name: "csv_mapping",
+				AttributeTypes: map[string]attr.Type{
+					"name_field":        types.StringType,
+					"code_field":        types.StringType,
+					"destination_field": types.StringType,
+					"label_fields": types.ListType{
+						ElemType: types.StringType,
+					},
+					"variable_fields": types.ListType{
+						ElemType: types.StringType,
+					},
+					"group_by_fields": types.ListType{
+						ElemType: types.StringType,
+					},
+				},
 			},
 		},
 		Return: function.MapReturn{
@@ -82,6 +86,7 @@ func destinationSchema() types.ObjectType {
 func returnSchema() types.ObjectType {
 	return types.ObjectType{
 		AttrTypes: map[string]attr.Type{
+			"name": types.StringType,
 			"labels": types.ListType{
 				ElemType: types.StringType,
 			},
@@ -100,16 +105,25 @@ func (f *UniqueContactFunction) Run(ctx context.Context, req function.RunRequest
 
 	// Read Terraform argument data into the variables
 	var data UniqueContactModel
-	if err := req.Arguments.Get(ctx, &data.CSV, &data.GroupByField, &data.CodeField, &data.DestinationField, &data.Labels, &data.Variables); err != nil {
+	var csv types.List
+	if err := req.Arguments.Get(ctx, &csv, &data); err != nil {
 		resp.Error = function.ConcatFuncErrors(resp.Error, err)
 
 		return
 	}
 
+	// TODO: add bounds check to access map element
 	var elements []map[string]string
-	diag := data.CSV.ElementsAs(ctx, &elements, true)
+	diag := csv.ElementsAs(ctx, &elements, true)
 	if diag.HasError() {
 		resp.Error = function.ConcatFuncErrors(resp.Error, function.FuncErrorFromDiags(ctx, diag))
+
+		return
+	}
+
+	groupByFields, err := listToLabels(data.GroupByFields)
+	if err != nil {
+		resp.Error = function.ConcatFuncErrors(resp.Error, function.NewFuncError(err.Error()))
 
 		return
 	}
@@ -137,6 +151,7 @@ func (f *UniqueContactFunction) Run(ctx context.Context, req function.RunRequest
 		contact struct {
 			mu *sync.Mutex
 
+			name         string
 			destinations []destination
 			labels       []string
 			variables    map[string]string
@@ -145,23 +160,36 @@ func (f *UniqueContactFunction) Run(ctx context.Context, req function.RunRequest
 
 	seen := make(map[string]contact)
 	for i, v := range elements {
-		name := stripSpaces(v[data.GroupByField.ValueString()])
+		name := stripSpaces(v[data.NameField.ValueString()])
 		if name == "" {
 			tflog.Warn(ctx, "element has empty name", map[string]interface{}{"i": i, "name": name})
 
 			continue
 		}
 
-		if _, ok := seen[name]; !ok {
-			seen[name] = contact{
+		keyFields := make([]string, 0, len(groupByFields))
+		for _, k := range groupByFields {
+			if v[k] != "" {
+				keyFields = append(keyFields, v[k])
+			}
+		}
+
+		key := name
+		if len(keyFields) != 0 {
+			key = strings.Join(keyFields, "-")
+		}
+
+		if _, ok := seen[key]; !ok {
+			seen[key] = contact{
 				mu:           &sync.Mutex{},
+				name:         name,
 				destinations: make([]destination, 0),
 				labels:       make([]string, 0),
 				variables:    make(map[string]string),
 			}
 		}
 
-		seen[name].mu.Lock()
+		seen[key].mu.Lock()
 
 		labels := make([]string, 0, len(labelFields))
 		for _, field := range labelFields {
@@ -170,14 +198,15 @@ func (f *UniqueContactFunction) Run(ctx context.Context, req function.RunRequest
 
 		d := destination{
 			code:        v[data.CodeField.ValueString()],
-			destination: v[data.DestinationField.ValueString()],
+			destination: "+" + destinationRegexp.ReplaceAllString(v[data.DestinationField.ValueString()], ""),
 		}
 
 		c := contact{
-			mu:           seen[name].mu,
-			destinations: append(seen[name].destinations, d),
-			labels:       append(seen[name].labels, labels...),
-			variables:    seen[name].variables,
+			mu:           seen[key].mu,
+			name:         seen[key].name,
+			destinations: append(seen[key].destinations, d),
+			labels:       append(seen[key].labels, labels...),
+			variables:    seen[key].variables,
 		}
 
 		for _, field := range variableFields {
@@ -188,8 +217,8 @@ func (f *UniqueContactFunction) Run(ctx context.Context, req function.RunRequest
 			c.variables[field] = v[field]
 		}
 
-		seen[name] = c
-		seen[name].mu.Unlock()
+		seen[key] = c
+		seen[key].mu.Unlock()
 	}
 
 	contacts := make(map[string]attr.Value, len(seen))
@@ -227,14 +256,16 @@ func (f *UniqueContactFunction) Run(ctx context.Context, req function.RunRequest
 		}
 
 		contacts[n] = types.ObjectValueMust(schema.AttrTypes, map[string]attr.Value{
+			"name":         types.StringValue(c.name),
 			"destinations": types.SetValueMust(destinationSchema(), destinations),
-			"labels":       types.ListValueMust(types.StringType, UniqueSliceElements(labels)),
+			"labels":       types.ListValueMust(types.StringType, labels),
 			"variables":    types.MapValueMust(types.StringType, variables),
 		})
 	}
 
 	// Set the result
-	// "foo bar": {
+	// "foo bar-bar": {
+	// 		"name": "foo bar",
 	// 		"labels": ["one", "foo", "bar"],
 	// 		"variables": [
 	// 			{
@@ -251,17 +282,4 @@ func (f *UniqueContactFunction) Run(ctx context.Context, req function.RunRequest
 	// }
 	// m := map[string]map[string]any{}
 	resp.Error = function.ConcatFuncErrors(resp.Error, resp.Result.Set(ctx, types.MapValueMust(returnSchema(), contacts)))
-}
-
-func UniqueSliceElements[T comparable](inputSlice []T) []T {
-	uniqueSlice := make([]T, 0, len(inputSlice))
-	seen := make(map[T]bool, len(inputSlice))
-	for _, element := range inputSlice {
-		if !seen[element] {
-			uniqueSlice = append(uniqueSlice, element)
-			seen[element] = true
-		}
-	}
-
-	return uniqueSlice
 }

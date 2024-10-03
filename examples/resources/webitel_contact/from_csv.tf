@@ -9,13 +9,22 @@ locals {
     bar1,1,123,local,foo,bar
   CSV
 
-  contacts = provider::webitel::unique_contact(csvdecode(csv_data), "name", "code", "destination", ["foo_label"], ["foo_variable", "bar_variable"])
+  mapping = {
+    name_field        = "name"
+    code_field        = "code"
+    destination_field = "destination"
+    label_fields      = ["foo_label"]
+    variable_fields   = ["foo_variable", "bar_variable"]
+    group_by_fields   = ["name", "foo_variable"]
+  }
+
+  contacts = provider::webitel::unique_contact(csvdecode(csv_data), local.mapping)
 }
 
 resource "webitel_contact" "from_file" {
   for_each = local.contacts
 
-  name      = each.key
+  name      = each.value.name
   labels    = each.value.labels
   phones    = each.value.destinations
   variables = each.value.variables
